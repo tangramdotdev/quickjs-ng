@@ -226,6 +226,16 @@ typedef struct JSShape JSShape;
 typedef struct JSString JSString;
 typedef struct JSString JSAtomStruct;
 
+/* Async stack frame for async stack traces */
+typedef struct JSAsyncStackFrame {
+    JSAtom function_name;
+    JSAtom filename;
+    int line_num;
+    int col_num;
+    struct JSAsyncStackFrame *parent;
+    int ref_count;
+} JSAsyncStackFrame;
+
 #define JS_VALUE_GET_STRING(v) ((JSString *)JS_VALUE_GET_PTR(v))
 
 typedef enum {
@@ -1328,7 +1338,8 @@ static JSValue js_new_promise_capability(JSContext *ctx,
 static __exception int perform_promise_then(JSContext *ctx,
                                             JSValueConst promise,
                                             JSValueConst *resolve_reject,
-                                            JSValueConst *cap_resolving_funcs);
+                                            JSValueConst *cap_resolving_funcs,
+                                            JSAsyncStackFrame *async_context);
 static JSValue js_promise_resolve(JSContext *ctx, JSValueConst this_val,
                                   int argc, JSValueConst *argv, int magic);
 static JSValue js_promise_then(JSContext *ctx, JSValueConst this_val,
@@ -7261,6 +7272,121 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
     }
 
     rt->in_build_stack_trace = false;
+}
+
+/* Async stack trace support */
+static JSAsyncStackFrame *capture_async_stack_frame_from_sf(JSContext *ctx,
+                                                            JSStackFrame *sf)
+{
+    JSAsyncStackFrame *frame;
+    JSObject *p;
+    JSFunctionBytecode *b;
+    int col_num;
+
+    if (!sf || JS_IsUndefined(sf->cur_func))
+        return NULL;
+
+    frame = js_mallocz(ctx, sizeof(*frame));
+    if (!frame)
+        return NULL;
+
+    frame->ref_count = 1;
+    frame->parent = NULL;
+    frame->function_name = JS_ATOM_NULL;
+    frame->filename = JS_ATOM_NULL;
+    frame->line_num = -1;
+    frame->col_num = -1;
+
+    p = JS_VALUE_GET_OBJ(sf->cur_func);
+    if (js_class_has_bytecode(p->class_id)) {
+        b = p->u.func.function_bytecode;
+        if (b->filename && sf->cur_pc) {
+            frame->filename = JS_DupAtom(ctx, b->filename);
+            frame->line_num = find_line_num(ctx, b,
+                                            sf->cur_pc - b->byte_code_buf - 1,
+                                            &col_num);
+            frame->col_num = col_num;
+        }
+        frame->function_name = JS_DupAtom(ctx, b->func_name);
+    }
+
+    return frame;
+}
+
+static void free_async_stack_frame(JSRuntime *rt, JSAsyncStackFrame *frame)
+{
+    while (frame) {
+        JSAsyncStackFrame *parent = frame->parent;
+        if (--frame->ref_count > 0)
+            return;
+        JS_FreeAtomRT(rt, frame->function_name);
+        JS_FreeAtomRT(rt, frame->filename);
+        js_free_rt(rt, frame);
+        frame = parent;
+    }
+}
+
+static JSAsyncStackFrame *dup_async_stack_frame(JSAsyncStackFrame *frame)
+{
+    if (frame)
+        frame->ref_count++;
+    return frame;
+}
+
+static void append_async_stack_trace(JSContext *ctx, JSValueConst error_obj,
+                                     JSAsyncStackFrame *async_context)
+{
+    JSValue stack_val;
+    const char *existing_stack;
+    DynBuf dbuf;
+    const char *func_name_str;
+    const char *filename_str;
+    JSAsyncStackFrame *frame;
+
+    if (!JS_IsObject(error_obj) || !async_context)
+        return;
+
+    stack_val = JS_GetPropertyStr(ctx, error_obj, "stack");
+    if (JS_IsException(stack_val))
+        return;
+
+    existing_stack = JS_ToCString(ctx, stack_val);
+    JS_FreeValue(ctx, stack_val);
+    if (!existing_stack)
+        return;
+
+    js_dbuf_init(ctx, &dbuf);
+    dbuf_putstr(&dbuf, existing_stack);
+    JS_FreeCString(ctx, existing_stack);
+
+    for (frame = async_context; frame != NULL; frame = frame->parent) {
+        func_name_str = JS_AtomToCString(ctx, frame->function_name);
+        if (!func_name_str || func_name_str[0] == '\0')
+            func_name_str = "<anonymous>";
+
+        dbuf_printf(&dbuf, "    at async %s", func_name_str);
+
+        if (frame->function_name != JS_ATOM_NULL)
+            JS_FreeCString(ctx, func_name_str);
+
+        if (frame->filename != JS_ATOM_NULL) {
+            filename_str = JS_AtomToCString(ctx, frame->filename);
+            dbuf_printf(&dbuf, " (%s", filename_str ? filename_str : "<null>");
+            JS_FreeCString(ctx, filename_str);
+            if (frame->line_num > 0)
+                dbuf_printf(&dbuf, ":%d:%d", frame->line_num, frame->col_num);
+            dbuf_putc(&dbuf, ')');
+        }
+        dbuf_putc(&dbuf, '\n');
+    }
+
+    dbuf_putc(&dbuf, '\0');
+    if (!dbuf_error(&dbuf)) {
+        stack_val = JS_NewString(ctx, (char *)dbuf.buf);
+        JS_DefinePropertyValue(ctx, error_obj, JS_ATOM_stack, stack_val,
+                               JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
+    }
+    dbuf_free(&dbuf);
 }
 
 JSValue JS_NewError(JSContext *ctx)
@@ -19647,6 +19773,7 @@ static bool js_async_function_resume(JSContext *ctx, JSAsyncFunctionData *s)
             goto resolved;
         } else {
             JSValue promise, resolving_funcs[2], resolving_funcs1[2];
+            JSAsyncStackFrame *async_context;
             int i, res;
 
             /* await */
@@ -19661,13 +19788,20 @@ static bool js_async_function_resume(JSContext *ctx, JSAsyncFunctionData *s)
                 goto fail;
             }
 
+            /* Capture async stack frame for stack traces from the async
+               function's saved frame */
+            async_context = capture_async_stack_frame_from_sf(ctx,
+                                                              &s->func_state.frame);
+
             /* Note: no need to create 'thrownawayCapability' as in
                the spec */
             for(i = 0; i < 2; i++)
                 resolving_funcs1[i] = JS_UNDEFINED;
             res = perform_promise_then(ctx, promise,
                                        vc(resolving_funcs),
-                                       vc(resolving_funcs1));
+                                       vc(resolving_funcs1),
+                                       async_context);
+            free_async_stack_frame(ctx->rt, async_context);
             JS_FreeValue(ctx, promise);
             for(i = 0; i < 2; i++)
                 JS_FreeValue(ctx, resolving_funcs[i]);
@@ -19870,7 +20004,8 @@ static int js_async_generator_await(JSContext *ctx,
         resolving_funcs1[i] = JS_UNDEFINED;
     res = perform_promise_then(ctx, promise,
                                vc(resolving_funcs),
-                               vc(resolving_funcs1));
+                               vc(resolving_funcs1),
+                               NULL);
     JS_FreeValue(ctx, promise);
     for(i = 0; i < 2; i++)
         JS_FreeValue(ctx, resolving_funcs[i]);
@@ -19960,7 +20095,8 @@ static int js_async_generator_completed_return(JSContext *ctx,
     resolving_funcs[1] = JS_UNDEFINED;
     res = perform_promise_then(ctx, promise,
                                vc(resolving_funcs1),
-                               vc(resolving_funcs));
+                               vc(resolving_funcs),
+                               NULL);
     JS_FreeValue(ctx, resolving_funcs1[0]);
     JS_FreeValue(ctx, resolving_funcs1[1]);
     JS_FreeValue(ctx, promise);
@@ -51079,6 +51215,7 @@ typedef struct JSPromiseReactionData {
     struct list_head link; /* not used in promise_reaction_job */
     JSValue resolving_funcs[2];
     JSValue handler;
+    JSAsyncStackFrame *async_context;
 } JSPromiseReactionData;
 
 JSPromiseStateEnum JS_PromiseState(JSContext *ctx, JSValueConst promise)
@@ -51113,6 +51250,7 @@ static void promise_reaction_data_free(JSRuntime *rt,
     JS_FreeValueRT(rt, rd->resolving_funcs[0]);
     JS_FreeValueRT(rt, rd->resolving_funcs[1]);
     JS_FreeValueRT(rt, rd->handler);
+    free_async_stack_frame(rt, rd->async_context);
     js_free_rt(rt, rd);
 }
 
@@ -51133,13 +51271,25 @@ static JSValue promise_reaction_job(JSContext *ctx, int argc,
     JSValue res, res2;
     JSValueConst arg;
     bool is_reject;
+    JSAsyncStackFrame *async_context = NULL;
+    int64_t async_context_ptr;
 
-    assert(argc == 5);
+    assert(argc == 6);
     handler = argv[2];
     is_reject = JS_ToBool(ctx, argv[3]);
     arg = argv[4];
+    /* async_context is passed as an int64 pointer */
+    if (JS_ToInt64(ctx, &async_context_ptr, argv[5]) == 0) {
+        async_context = (JSAsyncStackFrame *)(intptr_t)async_context_ptr;
+    }
 
     promise_trace(ctx, "promise_reaction_job: is_reject=%d\n", is_reject);
+
+    /* If this is a rejection and we have async context, append it to the
+       error before passing it to the handler */
+    if (is_reject && async_context && JS_IsObject(arg)) {
+        append_async_stack_trace(ctx, arg, async_context);
+    }
 
     if (JS_IsUndefined(handler)) {
         if (is_reject) {
@@ -51152,8 +51302,10 @@ static JSValue promise_reaction_job(JSContext *ctx, int argc,
     }
     is_reject = JS_IsException(res);
     if (is_reject) {
-        if (unlikely(JS_IsUncatchableError(ctx->rt->current_exception)))
+        if (unlikely(JS_IsUncatchableError(ctx->rt->current_exception))) {
+            free_async_stack_frame(ctx->rt, async_context);
             return JS_EXCEPTION;
+        }
         res = JS_GetException(ctx);
     }
     func = argv[is_reject];
@@ -51166,6 +51318,9 @@ static JSValue promise_reaction_job(JSContext *ctx, int argc,
         res2 = JS_UNDEFINED;
     }
     JS_FreeValue(ctx, res);
+
+    /* Free the async context (we own it) */
+    free_async_stack_frame(ctx->rt, async_context);
 
     return res2;
 }
@@ -51190,7 +51345,8 @@ static void fulfill_or_reject_promise(JSContext *ctx, JSValueConst promise,
     JSPromiseData *s = JS_GetOpaque(promise, JS_CLASS_PROMISE);
     struct list_head *el, *el1;
     JSPromiseReactionData *rd;
-    JSValueConst args[5];
+    JSValue args[6];
+    JSAsyncStackFrame *async_context;
 
     if (!s || s->promise_state != JS_PROMISE_PENDING)
         return; /* should never happen */
@@ -51221,7 +51377,10 @@ static void fulfill_or_reject_promise(JSContext *ctx, JSValueConst promise,
         args[2] = rd->handler;
         args[3] = js_bool(is_reject);
         args[4] = value;
-        JS_EnqueueJob(ctx, promise_reaction_job, 5, args);
+        /* Dup async_context for the job (job takes ownership) */
+        async_context = dup_async_stack_frame(rd->async_context);
+        args[5] = JS_NewInt64(ctx, (int64_t)(intptr_t)async_context);
+        JS_EnqueueJob(ctx, promise_reaction_job, 6, args);
         list_del(&rd->link);
         promise_reaction_data_free(ctx->rt, rd);
     }
@@ -51958,7 +52117,8 @@ static JSValue js_promise_race(JSContext *ctx, JSValueConst this_val,
 static __exception int perform_promise_then(JSContext *ctx,
                                             JSValueConst promise,
                                             JSValueConst *resolve_reject,
-                                            JSValueConst *cap_resolving_funcs)
+                                            JSValueConst *cap_resolving_funcs,
+                                            JSAsyncStackFrame *async_context)
 {
     JSPromiseData *s = JS_GetOpaque(promise, JS_CLASS_PROMISE);
     JSPromiseReactionData *rd_array[2], *rd;
@@ -51980,6 +52140,7 @@ static __exception int perform_promise_then(JSContext *ctx,
         if (!JS_IsFunction(ctx, handler))
             handler = JS_UNDEFINED;
         rd->handler = js_dup(handler);
+        rd->async_context = dup_async_stack_frame(async_context);
         rd_array[i] = rd;
     }
 
@@ -51987,7 +52148,8 @@ static __exception int perform_promise_then(JSContext *ctx,
         for(i = 0; i < 2; i++)
             list_add_tail(&rd_array[i]->link, &s->promise_reactions[i]);
     } else {
-        JSValueConst args[5];
+        JSValue args[6];
+        JSAsyncStackFrame *job_async_context;
         if (s->promise_state == JS_PROMISE_REJECTED && !s->is_handled) {
             JSRuntime *rt = ctx->rt;
             if (rt->host_promise_rejection_tracker)
@@ -52001,7 +52163,10 @@ static __exception int perform_promise_then(JSContext *ctx,
         args[2] = rd->handler;
         args[3] = js_bool(i);
         args[4] = s->promise_result;
-        JS_EnqueueJob(ctx, promise_reaction_job, 5, args);
+        /* Dup async_context for the job (job takes ownership) */
+        job_async_context = dup_async_stack_frame(rd->async_context);
+        args[5] = JS_NewInt64(ctx, (int64_t)(intptr_t)job_async_context);
+        JS_EnqueueJob(ctx, promise_reaction_job, 6, args);
         for(i = 0; i < 2; i++)
             promise_reaction_data_free(ctx->rt, rd_array[i]);
     }
@@ -52039,7 +52204,7 @@ static JSValue js_promise_then(JSContext *ctx, JSValueConst this_val,
     JS_FreeValue(ctx, ctor);
     if (JS_IsException(result_promise))
         return result_promise;
-    ret = perform_promise_then(ctx, this_val, argv, vc(resolving_funcs));
+    ret = perform_promise_then(ctx, this_val, argv, vc(resolving_funcs), NULL);
     for(i = 0; i < 2; i++)
         JS_FreeValue(ctx, resolving_funcs[i]);
     if (ret) {
@@ -52333,7 +52498,8 @@ static JSValue js_async_from_sync_iterator_next(JSContext *ctx, JSValueConst thi
 
         res = perform_promise_then(ctx, value_wrapper_promise,
                                    vc(resolve_reject),
-                                   vc(resolving_funcs));
+                                   vc(resolving_funcs),
+                                   NULL);
         JS_FreeValue(ctx, resolve_reject[0]);
         JS_FreeValue(ctx, value_wrapper_promise);
         JS_FreeValue(ctx, resolving_funcs[0]);
