@@ -1084,6 +1084,7 @@ typedef struct JSCallSiteData {
     JSValue func;
     JSValue func_name;
     bool native;
+    bool is_async;
     int line_num;
     int col_num;
 } JSCallSiteData;
@@ -7242,6 +7243,10 @@ static void build_backtrace(JSContext *ctx, JSValueConst error_val,
             JS_FreeValue(ctx, csd[k].func);
             JS_FreeValue(ctx, csd[k].func_name);
         }
+        /* Store CallSite array for potential async frame addition later */
+        JS_DefinePropertyValue(ctx, error_val, JS_ATOM__callSiteArray,
+                               js_dup(stack), JS_PROP_CONFIGURABLE);
+
         JSValueConst args[] = {
             error_val,
             stack,
@@ -7336,7 +7341,7 @@ static JSAsyncStackFrame *dup_async_stack_frame(JSAsyncStackFrame *frame)
 static void append_async_stack_trace(JSContext *ctx, JSValueConst error_obj,
                                      JSAsyncStackFrame *async_context)
 {
-    JSValue stack_val;
+    JSValue stack_val, callsite_array;
     const char *existing_stack;
     DynBuf dbuf;
     const char *func_name_str;
@@ -7346,6 +7351,60 @@ static void append_async_stack_trace(JSContext *ctx, JSValueConst error_obj,
     if (!JS_IsObject(error_obj) || !async_context)
         return;
 
+    /* Check if prepareStackTrace is in use and we have stored CallSites */
+    if (JS_IsFunction(ctx, ctx->error_prepare_stack)) {
+        callsite_array = JS_GetProperty(ctx, error_obj, JS_ATOM__callSiteArray);
+        if (!JS_IsException(callsite_array) && JS_IsArray(callsite_array)) {
+            JSValue len_val;
+            int64_t len;
+
+            len_val = JS_GetPropertyStr(ctx, callsite_array, "length");
+            if (!JS_IsException(len_val)) {
+                JS_ToInt64(ctx, &len, len_val);
+                JS_FreeValue(ctx, len_val);
+
+                /* Create CallSites for async frames and append to array */
+                for (frame = async_context; frame != NULL; frame = frame->parent) {
+                    JSCallSiteData csd;
+                    JSValue callsite;
+
+                    memset(&csd, 0, sizeof(csd));
+                    csd.is_async = true;
+                    csd.native = false;
+                    csd.line_num = frame->line_num;
+                    csd.col_num = frame->col_num;
+                    csd.filename = frame->filename != JS_ATOM_NULL
+                        ? JS_AtomToString(ctx, frame->filename) : JS_NULL;
+                    csd.func = JS_NULL;
+                    csd.func_name = frame->function_name != JS_ATOM_NULL
+                        ? JS_AtomToString(ctx, frame->function_name) : JS_NULL;
+
+                    callsite = js_new_callsite(ctx, &csd);
+                    if (JS_IsException(callsite)) {
+                        JS_FreeValue(ctx, csd.filename);
+                        JS_FreeValue(ctx, csd.func_name);
+                        break;
+                    }
+                    JS_DefinePropertyValueUint32(ctx, callsite_array, (uint32_t)len++,
+                                                 callsite, JS_PROP_C_W_E);
+                }
+
+                /* Re-invoke prepareStackTrace */
+                JSValueConst args[2] = { error_obj, callsite_array };
+                stack_val = JS_Call(ctx, ctx->error_prepare_stack,
+                                   ctx->error_ctor, 2, args);
+                if (!JS_IsException(stack_val)) {
+                    JS_DefinePropertyValue(ctx, error_obj, JS_ATOM_stack, stack_val,
+                                          JS_PROP_WRITABLE | JS_PROP_CONFIGURABLE);
+                }
+            }
+            JS_FreeValue(ctx, callsite_array);
+            return;
+        }
+        JS_FreeValue(ctx, callsite_array);
+    }
+
+    /* Fall back to string append (original behavior) */
     stack_val = JS_GetPropertyStr(ctx, error_obj, "stack");
     if (JS_IsException(stack_val))
         return;
@@ -58737,6 +58796,8 @@ static void js_new_callsite_data(JSContext *ctx, JSCallSiteData *csd, JSStackFra
     if (JS_IsException(csd->func_name))
         csd->func_name = JS_NULL;
 
+    csd->is_async = false;
+
     p = JS_VALUE_GET_OBJ(sf->cur_func);
     if (js_class_has_bytecode(p->class_id)) {
         JSFunctionBytecode *b = p->u.func.function_bytecode;
@@ -58765,6 +58826,7 @@ static void js_new_callsite_data2(JSContext *ctx, JSCallSiteData *csd, const cha
     csd->func = JS_NULL;
     csd->func_name = JS_NULL;
     csd->native = false;
+    csd->is_async = false;
     csd->line_num = line_num;
     csd->col_num = col_num;
     /* filename is UTF-8 encoded if needed (original argument to __JS_EvalInternal()) */
@@ -58792,6 +58854,14 @@ static JSValue js_callsite_isnative(JSContext *ctx, JSValueConst this_val, int a
     return js_bool(csd->native);
 }
 
+static JSValue js_callsite_isasync(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv)
+{
+    JSCallSiteData *csd = JS_GetOpaque2(ctx, this_val, JS_CLASS_CALL_SITE);
+    if (!csd)
+        return JS_EXCEPTION;
+    return js_bool(csd->is_async);
+}
+
 static JSValue js_callsite_getnumber(JSContext *ctx, JSValueConst this_val, int argc, JSValueConst *argv, int magic)
 {
     JSCallSiteData *csd = JS_GetOpaque2(ctx, this_val, JS_CLASS_CALL_SITE);
@@ -58803,6 +58873,7 @@ static JSValue js_callsite_getnumber(JSContext *ctx, JSValueConst this_val, int 
 
 static const JSCFunctionListEntry js_callsite_proto_funcs[] = {
     JS_CFUNC_DEF("isNative", 0, js_callsite_isnative),
+    JS_CFUNC_DEF("isAsync", 0, js_callsite_isasync),
     JS_CFUNC_MAGIC_DEF("getFileName", 0, js_callsite_getfield, offsetof(JSCallSiteData, filename)),
     JS_CFUNC_MAGIC_DEF("getFunction", 0, js_callsite_getfield, offsetof(JSCallSiteData, func)),
     JS_CFUNC_MAGIC_DEF("getFunctionName", 0, js_callsite_getfield, offsetof(JSCallSiteData, func_name)),

@@ -249,6 +249,7 @@ DEF(DOMException, "DOMException")
 DEF(CallSite, "CallSite")
 /* private symbols */
 DEF(Private_brand, "<brand>")
+DEF(_callSiteArray, "<callSiteArray>")
 /* symbols */
 DEF(Symbol_toPrimitive, "Symbol.toPrimitive")
 DEF(Symbol_iterator, "Symbol.iterator")
