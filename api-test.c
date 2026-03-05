@@ -12,6 +12,14 @@ static JSValue eval(JSContext *ctx, const char *code)
     return JS_Eval(ctx, code, strlen(code), "<input>", JS_EVAL_TYPE_GLOBAL);
 }
 
+static void execute_all_jobs(JSRuntime *rt, JSContext **pctx)
+{
+    while (JS_IsJobPending(rt)) {
+        int r = JS_ExecutePendingJob(rt, pctx);
+        assert(r == 1);
+    }
+}
+
 static JSValue cfunc_callback(JSContext *ctx, JSValueConst this_val,
                               int argc, JSValueConst *argv)
 {
@@ -269,6 +277,321 @@ static void async_call_stack_overflow(void)
     assert(!JS_HasException(ctx));
     assert(JS_IsError(value)); // stack overflow should be caught
     JS_FreeValue(ctx, value);
+    JS_FreeContext(ctx);
+    JS_FreeRuntime(rt);
+}
+
+static void async_stack_traces(void)
+{
+    static const char prepare_code[] =
+"globalThis.__async_stack_result = null; \
+Error.prepareStackTrace = (_, frames) => frames; \
+async function c() { await Promise.resolve(); throw new Error('boom'); } \
+async function b() { await c(); } \
+async function a() { await b(); } \
+a().catch(e => { \
+  const frames = e.stack; \
+  globalThis.__async_stack_result = { \
+    is_array: Array.isArray(frames), \
+    has_async: frames.some(f => f.isAsync()), \
+    has_async_b: frames.some(f => f.isAsync() && f.getFunctionName() === 'b'), \
+    has_private_leak: Object.getOwnPropertyNames(e).includes('<callSiteArray>'), \
+    message: e.message \
+  }; \
+}).finally(() => { Error.prepareStackTrace = undefined; });";
+    static const char throwing_prepare_code[] =
+"globalThis.__async_prepare_throw = null; \
+let calls = 0; \
+Error.prepareStackTrace = (_, frames) => { \
+  calls++; \
+  if (calls >= 2) \
+    throw new Error('prepare-fail'); \
+  return frames; \
+}; \
+async function x() { await Promise.resolve(); throw new Error('boom2'); } \
+async function y() { await x(); } \
+y().catch(e => { \
+  globalThis.__async_prepare_throw = { message: e.message, stack_type: typeof e.stack }; \
+}).finally(() => { Error.prepareStackTrace = undefined; });";
+    static const char fallback_code[] =
+"globalThis.__async_stack_string = null; \
+async function u() { await Promise.resolve(); throw new Error('boom3'); } \
+async function v() { await u(); } \
+v().catch(e => { globalThis.__async_stack_string = e.stack; });";
+    static const char async_generator_code[] =
+"globalThis.__async_generator_result = null; \
+Error.prepareStackTrace = (_, frames) => frames; \
+async function* g() { await Promise.resolve(); throw new Error('agen'); } \
+(async () => { \
+  try { \
+    for await (const _ of g()) {} \
+  } catch (e) { \
+    globalThis.__async_generator_result = { has_async: e.stack.some(f => f.isAsync()) }; \
+  } finally { \
+    Error.prepareStackTrace = undefined; \
+  } \
+})();";
+    static const char limit_prepare_code[] =
+"globalThis.__async_limit_prepare = null; \
+Error.stackTraceLimit = 1; \
+Error.prepareStackTrace = (_, frames) => frames; \
+async function lp1() { await Promise.resolve(); throw new Error('limit-prepare'); } \
+async function lp2() { await lp1(); } \
+lp2().catch(e => { \
+  globalThis.__async_limit_prepare = { \
+    len: e.stack.length, \
+    has_async: e.stack.some(f => f.isAsync()) \
+  }; \
+}).finally(() => { \
+  Error.prepareStackTrace = undefined; \
+  Error.stackTraceLimit = 10; \
+});";
+    static const char limit_fallback_code[] =
+"globalThis.__async_limit_fallback = null; \
+Error.stackTraceLimit = 1; \
+async function lf1() { await Promise.resolve(); throw new Error('limit-fallback'); } \
+async function lf2() { await lf1(); } \
+lf2().catch(e => { \
+  globalThis.__async_limit_fallback = e.stack; \
+}).finally(() => { \
+  Error.stackTraceLimit = 10; \
+});";
+    static const char dedupe_code[] =
+"globalThis.__async_dedupe = null; \
+Error.prepareStackTrace = (_, frames) => \
+  frames.map(f => (f.isAsync() ? 'A:' : 'S:') + String(f.getFunctionName())).join('|'); \
+async function leaf() { throw new Error('dup'); } \
+async function mid() { \
+  try { \
+    await leaf(); \
+  } catch (e) { \
+    await Promise.resolve(); \
+    throw e; \
+  } \
+} \
+async function top() { \
+  try { \
+    await mid(); \
+  } catch (e) { \
+    await Promise.resolve(); \
+    throw e; \
+  } \
+} \
+top().catch(e => { \
+  const stack = e.stack; \
+  globalThis.__async_dedupe = stack.split('A:top').length - 1; \
+}).finally(() => { \
+  Error.prepareStackTrace = undefined; \
+});";
+    static const char non_error_code[] =
+"globalThis.__async_non_error = null; \
+async function ne_leaf() { \
+  await Promise.resolve(); \
+  throw { stack: 'ORIG' }; \
+} \
+async function ne_top() { \
+  await ne_leaf(); \
+} \
+ne_top().catch(e => { \
+  globalThis.__async_non_error = e.stack; \
+});";
+    static const char hash_resize_code[] =
+"globalThis.__async_hash_resize = false; \
+Error.prepareStackTrace = (_, frames) => frames; \
+async function child(i) { \
+  await Promise.resolve(); \
+  throw new Error(String(i)); \
+} \
+async function parent(i) { \
+  await child(i); \
+} \
+Promise.all(Array.from({ length: 32 }, (_, i) => \
+  parent(i).catch(e => e.stack.some(f => f.isAsync())) \
+)).then(v => { \
+  globalThis.__async_hash_resize = v.every(Boolean); \
+}).finally(() => { \
+  Error.prepareStackTrace = undefined; \
+});";
+    JSRuntime *rt = JS_NewRuntime();
+    JSContext *ctx = JS_NewContext(rt);
+    JSValue ret, result, prop;
+    const char *str;
+    int b;
+
+    ret = eval(ctx, prepare_code);
+    assert(!JS_IsException(ret));
+    JS_FreeValue(ctx, ret);
+    execute_all_jobs(rt, &ctx);
+    assert(!JS_HasException(ctx));
+
+    result = eval(ctx, "globalThis.__async_stack_result");
+    assert(!JS_IsException(result));
+    assert(JS_IsObject(result));
+
+    prop = JS_GetPropertyStr(ctx, result, "is_array");
+    assert(!JS_IsException(prop));
+    b = JS_ToBool(ctx, prop);
+    assert(b == 1);
+    JS_FreeValue(ctx, prop);
+
+    prop = JS_GetPropertyStr(ctx, result, "has_async");
+    assert(!JS_IsException(prop));
+    b = JS_ToBool(ctx, prop);
+    assert(b == 1);
+    JS_FreeValue(ctx, prop);
+
+    prop = JS_GetPropertyStr(ctx, result, "has_async_b");
+    assert(!JS_IsException(prop));
+    b = JS_ToBool(ctx, prop);
+    assert(b == 1);
+    JS_FreeValue(ctx, prop);
+
+    prop = JS_GetPropertyStr(ctx, result, "has_private_leak");
+    assert(!JS_IsException(prop));
+    b = JS_ToBool(ctx, prop);
+    assert(b == 0);
+    JS_FreeValue(ctx, prop);
+
+    prop = JS_GetPropertyStr(ctx, result, "message");
+    assert(!JS_IsException(prop));
+    str = JS_ToCString(ctx, prop);
+    assert(str && !strcmp(str, "boom"));
+    JS_FreeCString(ctx, str);
+    JS_FreeValue(ctx, prop);
+    JS_FreeValue(ctx, result);
+
+    ret = eval(ctx, throwing_prepare_code);
+    assert(!JS_IsException(ret));
+    JS_FreeValue(ctx, ret);
+    execute_all_jobs(rt, &ctx);
+    assert(!JS_HasException(ctx));
+
+    result = eval(ctx, "globalThis.__async_prepare_throw");
+    assert(!JS_IsException(result));
+    assert(JS_IsObject(result));
+
+    prop = JS_GetPropertyStr(ctx, result, "message");
+    assert(!JS_IsException(prop));
+    str = JS_ToCString(ctx, prop);
+    assert(str && !strcmp(str, "boom2"));
+    JS_FreeCString(ctx, str);
+    JS_FreeValue(ctx, prop);
+
+    prop = JS_GetPropertyStr(ctx, result, "stack_type");
+    assert(!JS_IsException(prop));
+    str = JS_ToCString(ctx, prop);
+    assert(str && !strcmp(str, "object"));
+    JS_FreeCString(ctx, str);
+    JS_FreeValue(ctx, prop);
+    JS_FreeValue(ctx, result);
+
+    ret = eval(ctx, fallback_code);
+    assert(!JS_IsException(ret));
+    JS_FreeValue(ctx, ret);
+    execute_all_jobs(rt, &ctx);
+    assert(!JS_HasException(ctx));
+
+    result = eval(ctx, "globalThis.__async_stack_string");
+    assert(!JS_IsException(result));
+    assert(JS_IsString(result));
+    str = JS_ToCString(ctx, result);
+    assert(str);
+    assert(strstr(str, "at async v ("));
+    JS_FreeCString(ctx, str);
+    JS_FreeValue(ctx, result);
+
+    ret = eval(ctx, async_generator_code);
+    assert(!JS_IsException(ret));
+    JS_FreeValue(ctx, ret);
+    execute_all_jobs(rt, &ctx);
+    assert(!JS_HasException(ctx));
+
+    result = eval(ctx, "globalThis.__async_generator_result");
+    assert(!JS_IsException(result));
+    assert(JS_IsObject(result));
+    prop = JS_GetPropertyStr(ctx, result, "has_async");
+    assert(!JS_IsException(prop));
+    b = JS_ToBool(ctx, prop);
+    assert(b == 1);
+    JS_FreeValue(ctx, prop);
+    JS_FreeValue(ctx, result);
+
+    ret = eval(ctx, limit_prepare_code);
+    assert(!JS_IsException(ret));
+    JS_FreeValue(ctx, ret);
+    execute_all_jobs(rt, &ctx);
+    assert(!JS_HasException(ctx));
+
+    result = eval(ctx, "globalThis.__async_limit_prepare");
+    assert(!JS_IsException(result));
+    assert(JS_IsObject(result));
+    prop = JS_GetPropertyStr(ctx, result, "len");
+    assert(!JS_IsException(prop));
+    {
+        int32_t len = 0;
+        assert(JS_ToInt32(ctx, &len, prop) == 0);
+        assert(len == 1);
+    }
+    JS_FreeValue(ctx, prop);
+    prop = JS_GetPropertyStr(ctx, result, "has_async");
+    assert(!JS_IsException(prop));
+    b = JS_ToBool(ctx, prop);
+    assert(b == 0);
+    JS_FreeValue(ctx, prop);
+    JS_FreeValue(ctx, result);
+
+    ret = eval(ctx, limit_fallback_code);
+    assert(!JS_IsException(ret));
+    JS_FreeValue(ctx, ret);
+    execute_all_jobs(rt, &ctx);
+    assert(!JS_HasException(ctx));
+
+    result = eval(ctx, "globalThis.__async_limit_fallback");
+    assert(!JS_IsException(result));
+    assert(JS_IsString(result));
+    str = JS_ToCString(ctx, result);
+    assert(str);
+    assert(!strstr(str, "at async "));
+    JS_FreeCString(ctx, str);
+    JS_FreeValue(ctx, result);
+
+    ret = eval(ctx, dedupe_code);
+    assert(!JS_IsException(ret));
+    JS_FreeValue(ctx, ret);
+    execute_all_jobs(rt, &ctx);
+    assert(!JS_HasException(ctx));
+    result = eval(ctx, "globalThis.__async_dedupe");
+    assert(!JS_IsException(result));
+    {
+        int32_t count = 0;
+        assert(JS_ToInt32(ctx, &count, result) == 0);
+        assert(count == 1);
+    }
+    JS_FreeValue(ctx, result);
+
+    ret = eval(ctx, non_error_code);
+    assert(!JS_IsException(ret));
+    JS_FreeValue(ctx, ret);
+    execute_all_jobs(rt, &ctx);
+    assert(!JS_HasException(ctx));
+    result = eval(ctx, "globalThis.__async_non_error");
+    assert(!JS_IsException(result));
+    str = JS_ToCString(ctx, result);
+    assert(str && !strcmp(str, "ORIG"));
+    JS_FreeCString(ctx, str);
+    JS_FreeValue(ctx, result);
+
+    ret = eval(ctx, hash_resize_code);
+    assert(!JS_IsException(ret));
+    JS_FreeValue(ctx, ret);
+    execute_all_jobs(rt, &ctx);
+    assert(!JS_HasException(ctx));
+    result = eval(ctx, "globalThis.__async_hash_resize");
+    assert(!JS_IsException(result));
+    b = JS_ToBool(ctx, result);
+    assert(b == 1);
+    JS_FreeValue(ctx, result);
+
     JS_FreeContext(ctx);
     JS_FreeRuntime(rt);
 }
@@ -911,6 +1234,7 @@ int main(void)
     sync_call();
     async_call();
     async_call_stack_overflow();
+    async_stack_traces();
     raw_context_global_var();
     is_array();
     module_serde();
